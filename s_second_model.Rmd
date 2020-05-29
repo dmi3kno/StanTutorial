@@ -1,0 +1,327 @@
+---
+title: "Building your first Stan model. Seaice example"
+output: html_notebook
+---
+
+This is an example extended and modified from  [OUR Coding Club](https://github.com/ourcodingclub/CC-Stan-intro). 
+Data from [National Snow and Ice Data Center](https://nsidc.org/)
+
+```{r}
+ice <- read.csv("data/seaice.csv", stringsAsFactors = FALSE)
+```
+
+
+```{r}
+plot(extent_north ~ year, data=ice, pch=20)
+```
+
+```{r}
+lm_north <- lm(extent_north ~ year, data=ice)
+summary(lm_north)
+```
+We can add linear model to the plot by throwing it into `abline()`
+
+```{r}
+plot(extent_north ~ year, data=ice, pch=20)
+abline(lm_north, col="red", lty=2)
+```
+
+So the equation of our linear model is $$y=\alpha+\beta x+\sigma$$. We're trying to estimate change of ice cap from the beginning of observations in 1978, so lets make sure the data reflects that. 
+
+```{r}
+ice$year_n <- ice$year - 1978
+```
+
+The linear model we are interested in is
+
+```{r}
+lm_north1 <- lm(extent_north ~ year_n, data=ice)
+
+lm_north1_summary <- broom::tidy(lm_north1)
+knitr::kable(lm_north1_summary)
+```
+
+Let's collect data for Stan
+
+```{r}
+stan_data <- with(ice, list(N=length(year_n), 
+                            y=extent_north,
+                            x=year_n))
+stan_data
+# compile model
+library(rstan)
+options(mc.cores = floor(parallel::detectCores()/2))
+```
+
+Let's compose simple Stan model for linear regression. You can pass the options to a `stan_model` chunk within `engine.opts` list. [Defaults](https://mc-stan.org/rstan/reference/stan_model.html) for `rstan::stan_model()` are reasonably good so in most instances you wouldnt need that. 
+
+```{stan output.var=ice_stan_model}
+// Names of data elements should match incoming list
+data {
+ int <lower = 1> N; // Sample size
+ vector[N] x; // Predictor. Note, no type
+ vector[N] y; // Outcome
+}
+
+parameters {
+ real alpha; // Intercept
+ real beta; // Slope (regression coefficients)
+ real <lower = 0> sigma; // positive Error SD
+}
+
+// priors are not specified. Implicit U(-Inf,Inf)
+model {
+ y ~ normal(alpha + x * beta , sigma);
+}
+
+generated quantities {
+} // The posterior predictive distribution will go here
+```
+
+```{r}
+ice_fit <- sampling(ice_stan_model, data=stan_data, iter=1000, chains=4) 
+ice_fit
+```
+
+Let's extract the parameters and explore the posterior
+
+```{r}
+ice_posterior <- extract(ice_fit)
+str(ice_posterior)
+```
+
+Spagetti plot in base R!
+
+```{r}
+plot(extent_north ~ year_n, data=ice, pch=20)
+
+idx <- sample(seq_along(ice_posterior$alpha), 500, replace = FALSE)
+for (i in idx)
+        abline(ice_posterior$alpha[i], ice_posterior$beta[i], col=scales::alpha("gray50", 0.1), lty=1)
+abline(mean(ice_posterior$alpha), mean(ice_posterior$beta), col="magenta")
+abline(lm_north1, col = "red", lty = 2)
+```
+
+## Changing priors
+
+Let's try somewhat informative priors to inform our sampler. Recall that the our intercept was around 12.5 and slope -0.05. Lets put something bogus.
+
+```{stan output.var=ice_stan_model_ip}
+// Stan model for simple linear regression
+
+data {
+ int <lower = 1> N; // Sample size
+ vector[N] x; // Predictor
+ vector[N] y; // Outcome
+}
+
+parameters {
+ real alpha; // Intercept
+ real beta; // Slope (regression coefficients)
+ real <lower = 0> sigma; // Error SD
+}
+
+model {
+ alpha ~ normal(10, 0.1);
+ beta ~ normal(1, 0.1);
+ y ~ normal(alpha + x * beta , sigma);
+}
+// saving for later
+generated quantities {
+}
+```
+
+Now Stan has compiled a model for us and put into a variable, so we can start sampling.
+
+```{r}
+ice_fit_ip <- sampling(ice_stan_model_ip, data = stan_data, iter = 1000, chains = 4)
+ice_fit_ip
+```
+The model has converged.
+
+> 'Anything over an `n_eff` of 100 is usually "fine"' - Bob Carpenter
+
+```{r}
+ice_posterior_ip <- extract(ice_fit_ip)
+
+# old lines
+plot(extent_north ~ year_n, data=ice)
+
+idx <- sample(seq_along(ice_posterior_ip$alpha), 500, replace = FALSE)
+# new line
+for (i in idx)
+        abline(ice_posterior_ip$alpha[i], ice_posterior_ip$beta[i], col=scales::alpha("gray50", 0.1), lty=1)
+abline(mean(ice_posterior_ip$alpha), mean(ice_posterior_ip$beta), col="forestgreen")
+abline(mean(ice_posterior$alpha), mean(ice_posterior$beta), col="magenta")
+abline(lm_north1, col = "red", lty = 2)
+```
+
+
+So, what happened? If your priors are too narrow but off, you are going to get some strange fits. Let's examing traceplots.
+
+```{r}
+plot(ice_posterior_ip$alpha, type = "l")
+plot(ice_posterior_ip$beta, type = "l")
+plot(ice_posterior_ip$sigma, type = "l")
+```
+
+Poor convergence can happen when you use too few iterations. Re-sampling our original (non IP) analysis. Note single function `traceplot` that shows all parameters
+
+```{r, fig.width=15, fig.height=5}
+ice_fit_bad <- sampling(ice_stan_model, data = stan_data, iter = 50, chains = 4)
+traceplot(ice_fit_bad)
+```
+
+## Summary of parameters
+
+Blue lines represent estimate from our `lm` model
+
+```{r, fig.width=15, fig.height=5}
+par(mfrow = c(1,3))
+
+plot(density(ice_posterior$alpha), main = "Alpha")
+abline(v = lm_north1_summary$estimate[1], col = "blue", lty = 2)
+
+plot(density(ice_posterior$beta), main = "Beta")
+abline(v = lm_north1_summary$estimate[2], col = "blue", lty = 2)
+
+plot(density(ice_posterior$sigma), main = "Sigma")
+abline(v = sigma(lm_north1), col = 4, lty = 2)
+
+par(mfrow = c(1,1))
+```
+
+Same using built-in function
+
+```{r, fig.width=15, fig.height=5}
+stan_dens(ice_fit)
+#stan_hist(ice_fit_ip_bad)
+```
+
+## Posterior predictive checks
+
+For prediction and as another form of model diagnostic, Stan can use **random number generators to generate predicted values for each data point**, at each iteration. We generate these using the `generated quantities` block. Note that there's no vectorization in GQ block.
+
+```{stan output.var=ice_stan_model_pp}
+data {
+ int <lower = 1> N; // Sample size
+ vector[N] x; // Predictor
+ vector[N] y; // Outcome
+}
+
+parameters {
+ real alpha; // Intercept
+ real beta; // Slope (regression coefficients)
+ real <lower = 0> sigma; // Error SD
+}
+
+model {
+ y ~ normal(x * beta + alpha, sigma);
+}
+
+generated quantities {
+ real y_rep[N];
+
+ for (n in 1:N)
+   y_rep[n] = normal_rng(x[n] * beta + alpha, sigma);
+}
+```
+
+```{r}
+ice_fit_pp <- sampling(ice_stan_model_pp, data = stan_data, iter=1000, chains=4)
+ice_fit_pp
+```
+
+We can extract `y_rep` with specialized `as.matrix` method. Each row here is a single postenrior estimate from the model
+
+```{r}
+y_rep <- as.matrix(ice_fit_pp, pars="y_rep")
+dim(y_rep)
+```
+
+Compare the density of our `extent_north` to some 200 draws from posterior 
+
+```{r}
+library(bayesplot)
+ggplot2::theme_set(hrbrthemes::theme_ipsum_rc(grid_col = "gray95"))
+
+ppc_dens_overlay(ice$extent_north, y_rep[1:200,])
+```
+
+We can also compare summary statistics. You can choose any summary statistics function, even your own. See `bayesplot` docs for details.
+
+```{r}
+ppc_stat(y = ice$extent_north, yrep = y_rep, stat = "mean")
+```
+
+Here's a comparison of mean posterior prediction **per datapoint** vs the observed value for each datapoint (default line is 1:1)
+
+```{r}
+ppc_scatter_avg(y = ice$extent_north, yrep = y_rep)
+```
+
+## Some useful tips for fitting Stan models
+
+### DRY
+Avoid repeated operations
+
+```{stan}
+// 1/alpha is repeated
+  for(n in 1:N)
+    y[n]~ exponential(1/alpha * x[n]);
+```
+
+### Vectorization
+
+Use it where possible. It is cleaner (and faster)
+
+```{stan}
+// not vectorized
+  for(n in 1:N)
+     y[n]~ normal(beta0 + beta1 * x[n], sigma);
+     
+//vectorized
+  y ~ normal(beta0 + beta1 * x, sigma);
+```
+
+### Priors
+
+The more informative the better (think better initial conditions). Use experts and/or MLE to get initial estimates.
+
+### Parallization
+
+You can run multiple chains if you have multiplecores, but each chain is still serial
+
+
+### Look under the hood
+
+Check our `shredder` package
+
+```{r}
+# remotes::install_github('metrumresearchgroup/shredder')
+library(shredder)
+
+# estract single chain
+ice_fit_pp %>% 
+  stan_retain(chains=1)
+
+#extract specific parameters
+ice_fit_pp %>% 
+  stan_select(y_rep)
+
+#also shredder::stan_contains, shredder::stan_starts_with, shredder::stan_ends_with helpers
+ice_fit_pp %>% 
+  stan_select(stan_starts_with("y"))
+
+# slice (filter by index)
+ice_fit_pp %>% 
+        stan_select(stan_starts_with("y")) %>% 
+        stan_slice(1:10) 
+
+# or filter by condition
+ice_fit_pp %>% 
+        stan_select(alpha, beta, sigma) %>% 
+        stan_filter(alpha > 12.55)
+```
+
+
